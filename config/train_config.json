@@ -1,0 +1,19 @@
+{
+    "train_paths": [
+        "/path/to/speech/dataset",
+        "/path/to/music/dataset"
+    ],
+    "val_paths": [
+        "/path/to/validation/speech",
+        "/path/to/validation/music"
+    ],
+    "num_workers": 4,
+    "use_webdataset": false,
+    "train_urls": [],
+    "model_save_interval": 10000,
+    "log_interval": 100,
+    "eval_interval": 5000,
+    "early_stopping_patience": 3,
+    "seed": 42,
+    "notes": "HuMERT-300M training with 2-stage curriculum learning"
+}
