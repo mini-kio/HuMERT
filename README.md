@@ -177,9 +177,10 @@ The model targets state-of-the-art performance on:
 - **Audio Quality**: DAC reconstruction with 9 codebooks
 - **Efficiency**: 2.3x training speedup vs baseline models
 
+
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
 
 ## 🙏 Acknowledgments
 
@@ -188,10 +189,5 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - DAC compression from [Kumar et al. 2023](https://arxiv.org/abs/2306.06546)
 - Multi-teacher learning inspired by [Chen et al. 2022](https://arxiv.org/abs/2206.04669)
 
-## 📞 Contact
-
-For questions and support, please open an issue on GitHub or contact the development team.
-
----
 
 **HuMERT-300M**: Universal Audio Understanding in 300M Parameters 🎵🎤
