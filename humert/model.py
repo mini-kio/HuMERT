@@ -18,21 +18,29 @@ class HuMERTModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        
+
         # Core components
         self.frontend = ConvFrontend24k(config)
         self.encoder = FlashLinearTransformerEncoder(config)
         self.prediction_heads = PredictionHeads(config)
-        
-        # Teacher models (for label generation)
+
+        # Teachers
         self.dac_teacher = DACTeacher(config)
         self.speech_teacher = SpeechTeacher(config)
         self.musical_teacher = MusicalTeacher(config)
-        
-        # Loss function
+
+        # Loss
         self.criterion = MultiTaskLoss(config)
-        
-        # Model statistics  
+
+        # EMA
+        self.use_ema = getattr(config, 'use_ema', False)
+        self.ema_decay = getattr(config, 'ema_decay', 0.999)
+        self.ema_params: Dict[str, torch.Tensor] = {}
+        self.ema_initialized = False
+        self.ema_device = getattr(config, 'ema_device', 'cpu')
+        self._swap_backup: Dict[str, torch.Tensor] = {}
+
+        # Stats
         self.total_params = self.count_parameters()
         print(f"HuMERT-300M initialized with {self.total_params/1e6:.1f}M parameters")
         
@@ -90,6 +98,26 @@ class HuMERTModel(nn.Module):
             if self.training:
                 losses = self.compute_losses(predictions, teacher_labels, mask_indices)
                 outputs.update(losses)
+
+                # 7. Optional: codebook usage stats (raw before mask) for monitoring
+                if getattr(self.config, 'log_codebook_stats', False) and 'dac_tokens' in teacher_labels:
+                    with torch.no_grad():
+                        tokens = teacher_labels['dac_tokens']  # [B,T,C]
+                        # Unique per codebook & perplexity approximation
+                        B, T, Cb = tokens.shape
+                        flat = tokens.view(-1, Cb)  # [B*T, C]
+                        uniques = []
+                        perplexities = []
+                        for c in range(Cb):
+                            col = flat[:, c]
+                            vals, counts = col.unique(return_counts=True)
+                            p = counts.float() / counts.sum()
+                            entropy = -(p * (p+1e-12).log()).sum()
+                            perp = (entropy.exp()).clamp_min(1.0)
+                            perplexities.append(perp)
+                            uniques.append(float(vals.numel()))
+                        outputs['dac_codebook_unique'] = torch.tensor(uniques, device=encoded_features.device)
+                        outputs['dac_codebook_perplexity'] = torch.stack(perplexities)
         
         return outputs
     
@@ -268,6 +296,51 @@ class HuMERTModel(nn.Module):
             
         torch.save(checkpoint, filepath)
         print(f"Checkpoint saved to {filepath}")
+
+    # ================= EMA ================= #
+    def _init_ema(self):
+        if self.ema_initialized:
+            return
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                self.ema_params[name] = param.detach().to(self.ema_device).clone()
+        self.ema_initialized = True
+
+    @torch.no_grad()
+    def update_ema(self, global_step: int):
+        if not self.use_ema:
+            return
+        start_after = getattr(self.config, 'ema_update_after', 0)
+        if global_step < start_after:
+            return
+        if not self.ema_initialized:
+            self._init_ema()
+        decay = self.ema_decay
+        for name, param in self.named_parameters():
+            if not param.requires_grad or name not in self.ema_params:
+                continue
+            ema_v = self.ema_params[name]
+            ema_v.mul_(decay).add_(param.detach().to(ema_v.device), alpha=1 - decay)
+
+    def swap_to_ema(self):
+        if not self.use_ema or not self.ema_initialized:
+            return
+        # Backup current params and load EMA
+        self._swap_backup = {}
+        for name, param in self.named_parameters():
+            if name in self.ema_params and param.requires_grad:
+                self._swap_backup[name] = param.detach().cpu().clone()
+                param.data.copy_(self.ema_params[name].to(param.device))
+
+    def swap_from_ema(self):
+        if not self._swap_backup:
+            return
+        for name, buf in self._swap_backup.items():
+            for n, param in self.named_parameters():
+                if n == name:
+                    param.data.copy_(buf.to(param.device))
+                    break
+        self._swap_backup = {}
     
     @classmethod
     def load_checkpoint(cls, filepath: str, device: str = 'cpu') -> Tuple['HuMERTModel', Dict]:

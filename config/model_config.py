@@ -53,6 +53,9 @@ class ModelConfig:
     alignment_return_indices: bool = False  # if True, return mapping indices for debugging
     alignment_smooth_kernel: int = 0        # odd >1 applies temporal smoothing after alignment (continuous feats)
     
+    # Logging / diagnostics
+    log_codebook_stats: bool = True         # log codebook perplexity & unique token counts during training
+    
     def __post_init__(self):
         if self.conv_block_strides is None:
             self.conv_block_strides = [2, 2, 2, 2]
@@ -102,6 +105,13 @@ class TrainingConfig:
     # Scheduler / total steps
     total_steps: int = 0  # If 0, will be computed from stage steps
     min_lr_ratio: float = 0.1  # floor_lr = base_lr * min_lr_ratio
+
+    # EMA (Exponential Moving Average)
+    use_ema: bool = True
+    ema_decay: float = 0.999
+    ema_update_after: int = 1000            # start EMA updates after this many global steps
+    ema_device: str = 'cpu'                 # store EMA weights on cpu to save GPU memory
+    use_ema_for_eval: bool = True           # swap to EMA weights during validation
 
     def __post_init__(self):
         if self.total_steps == 0:

@@ -118,82 +118,69 @@ class HuMERTTrainer:
         return create_data_loaders(data_config)
     
     def train_step(self, batch: Dict[str, torch.Tensor], stage: int) -> Dict[str, float]:
-        """Single training step"""
-        
+        """Single training step (handles AMP, clipping, EMA, metrics)."""
         waveforms = batch['waveforms'].to(self.device)
-        language_ids = batch['language_ids'].to(self.device) if 'language_ids' in batch else None
-        
-        # Determine active heads based on batch content
+        # language_ids currently unused in model forward but kept for future
+        _ = batch.get('language_ids', None)
+
         active_heads = {
             'dac': True,
             'speech': any(atype == 'speech' for atype in batch.get('audio_types', ['unknown'])),
             'music': any(atype == 'music' for atype in batch.get('audio_types', ['unknown']))
         }
-        
-        # Forward pass
+
         if self.scaler is not None:
             with self.autocast():
-                outputs = self.model(
-                    waveforms, 
-                    return_teacher_labels=True,
-                    active_heads=active_heads
-                )
+                outputs = self.model(waveforms, return_teacher_labels=True, active_heads=active_heads)
                 loss = outputs['total']
-            
-            # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
-            
-            # Gradient clipping
             self.scaler.unscale_(self.optimizer)
             grad_norm = self.gradient_clipper.clip_gradients(self.model)
-            
-            # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
-            outputs = self.model(
-                waveforms,
-                return_teacher_labels=True, 
-                active_heads=active_heads
-            )
+            outputs = self.model(waveforms, return_teacher_labels=True, active_heads=active_heads)
             loss = outputs['total']
-            
-            # Backward pass
             loss.backward()
-            
-            # Gradient clipping
             grad_norm = self.gradient_clipper.clip_gradients(self.model)
-            
-            # Optimizer step
             self.optimizer.step()
-        
+
         self.optimizer.zero_grad()
         self.scheduler.step()
-        
-        # Collect metrics
-        metrics = {
-            'total_loss': loss.item(),
-            'grad_norm': grad_norm,
-            'learning_rate': self.scheduler.get_last_lr()[0]
+
+        model_base = self.model.module if hasattr(self.model, 'module') else self.model
+        if getattr(model_base, 'use_ema', False):
+            model_base.update_ema(self.global_step)
+
+        metrics: Dict[str, float] = {
+            'total_loss': float(loss.item()),
+            'grad_norm': float(grad_norm),
+            'learning_rate': float(self.scheduler.get_last_lr()[0])
         }
-        
-        # Add individual task losses
         for key, value in outputs.items():
             if key.endswith('_weighted') and isinstance(value, torch.Tensor):
-                metrics[key] = value.item()
+                metrics[key] = float(value.item())
             if key in ('dac','speech','music') and isinstance(value, torch.Tensor):
-                metrics[f'{key}_raw'] = value.item()
+                metrics[f'{key}_raw'] = float(value.item())
         if 'task_weights' in outputs:
             tw = outputs['task_weights']
             for i, name in enumerate(['dac','speech','music']):
                 if i < tw.numel():
                     metrics[f'{name}_weight'] = float(tw[i].item())
-        
+        if 'dac_codebook_perplexity' in outputs:
+            metrics['dac_codebook_perplexity_mean'] = float(outputs['dac_codebook_perplexity'].mean().item())
+        if 'dac_codebook_unique' in outputs:
+            metrics['dac_codebook_unique_mean'] = float(outputs['dac_codebook_unique'].float().mean().item())
         return metrics
     
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """Validation loop"""
         self.model.eval()
+        model_base = self.model.module if hasattr(self.model, 'module') else self.model
+        swapped = False
+        if getattr(model_base, 'use_ema', False) and getattr(model_base.config, 'use_ema_for_eval', True) and model_base.ema_initialized:
+            model_base.swap_to_ema()
+            swapped = True
         val_metrics = {}
         total_samples = 0
         
@@ -217,6 +204,8 @@ class HuMERTTrainer:
         for key in val_metrics:
             val_metrics[key] /= total_samples
         
+        if swapped:
+            model_base.swap_from_ema()
         self.model.train()
         return val_metrics
     
