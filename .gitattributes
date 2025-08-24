@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Treat audio & model artifacts as binary
+*.wav binary
+*.flac binary
+*.mp3 binary
+*.m4a binary
+*.aac binary
+*.pt binary
+*.ckpt binary

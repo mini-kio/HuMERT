@@ -30,18 +30,7 @@ class CosineWarmupScheduler(_LRScheduler):
             return [base_lr * lr_factor for base_lr in self.base_lrs]
 
 
-class OptimizerConfig:
-    def __init__(self):
-        self.learning_rate = 1e-4
-        self.betas = (0.9, 0.98)
-        self.weight_decay = 0.02
-        self.gradient_clipping = 1.0
-        self.warmup_steps = 8000
-        self.total_steps = 335000  # Total training steps
-        self.min_lr_ratio = 1e-5 / 1e-4  # Stage 3 lr floor
-
-
-def create_optimizer_and_scheduler(model: nn.Module, config: OptimizerConfig) -> tuple:
+def create_optimizer_and_scheduler(model: nn.Module, config) -> tuple:
     """Create optimizer and learning rate scheduler"""
     
     # Separate parameters for different components
@@ -78,11 +67,16 @@ def create_optimizer_and_scheduler(model: nn.Module, config: OptimizerConfig) ->
         )
     
     # Create cosine warmup scheduler
+    total_steps = getattr(config, 'total_steps', None)
+    if total_steps is None or total_steps == 0:
+        # Fallback: infer from known stage attributes if present
+        stage_attrs = [getattr(config, n, 0) for n in ['stage1_steps','stage2_steps','stage3_steps']]
+        total_steps = sum(stage_attrs) if any(stage_attrs) else 100000
     scheduler = CosineWarmupScheduler(
         optimizer,
-        warmup_steps=config.warmup_steps,
-        total_steps=config.total_steps,
-        min_lr_ratio=config.min_lr_ratio
+        warmup_steps=getattr(config, 'warmup_steps', 8000),
+        total_steps=total_steps,
+        min_lr_ratio=getattr(config, 'min_lr_ratio', 0.1)
     )
     
     return optimizer, scheduler
@@ -125,7 +119,7 @@ class MemoryOptimizer:
     def setup_zero_optimization(model: nn.Module, optimizer, stage: int = 2):
         """Setup ZeRO optimization if DeepSpeed is available"""
         try:
-            import deepspeed
+            import deepspeed  # noqa: F401
             
             # ZeRO-2 configuration
             zero_config = {

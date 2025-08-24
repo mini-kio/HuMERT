@@ -9,6 +9,7 @@ import numpy as np
 import random
 from typing import Dict, List, Optional, Tuple, Any
 import webdataset as wds
+import io
 from pathlib import Path
 
 
@@ -248,7 +249,8 @@ def create_data_loaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]
             shuffle=True,
             num_workers=config['num_workers'],
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            collate_fn=collate_batch
         )
     
     # Validation data loader
@@ -265,7 +267,8 @@ def create_data_loaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]
         shuffle=False,
         num_workers=config['num_workers'],
         pin_memory=True,
-        drop_last=False
+        drop_last=False,
+        collate_fn=collate_batch
     )
     
     return train_loader, val_loader

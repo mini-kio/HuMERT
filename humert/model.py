@@ -83,7 +83,7 @@ class HuMERTModel(nn.Module):
         
         # 5. Generate teacher labels if requested
         if return_teacher_labels:
-            teacher_labels = self.generate_teacher_labels(waveform)
+            teacher_labels = self.generate_teacher_labels(waveform, encoded_features.size(1))
             outputs.update(teacher_labels)
             
             # 6. Compute losses
@@ -93,25 +93,76 @@ class HuMERTModel(nn.Module):
         
         return outputs
     
-    def generate_teacher_labels(self, waveform: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Generate labels from teacher models"""
-        teacher_labels = {}
-        
-        # Generate DAC labels
+    def generate_teacher_labels(self, waveform: torch.Tensor, target_len: int) -> Dict[str, torch.Tensor]:
+        """Generate and length-align teacher labels to encoder sequence length.
+
+        Args:
+            waveform: [B, T_audio]
+            target_len: encoder time steps
+        Returns:
+            Dict with aligned teacher targets (dac_tokens [B,target_len,num_codebooks], etc.)
+        """
+        teacher_labels: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
             dac_outputs = self.dac_teacher(waveform)
-            teacher_labels['dac_tokens'] = dac_outputs['dac_tokens']
-        
-        # Generate Speech labels  
-        with torch.no_grad():
             speech_outputs = self.speech_teacher(waveform)
-            teacher_labels['speech_tokens'] = speech_outputs['speech_tokens']
-        
-        # Generate Musical labels
-        with torch.no_grad():
             music_outputs = self.musical_teacher(waveform)
-            teacher_labels['music_features'] = music_outputs['music_features']
-        
+
+            audio_len = waveform.shape[-1]
+            frontend_hop = self.frontend.get_downsample_rate()
+
+            # DAC alignment
+            dac_tokens_raw = dac_outputs['dac_tokens']  # [B, Td, C]
+            B0, Td, Ccode = dac_tokens_raw.shape
+            dac_hop = audio_len / Td if Td > 0 else frontend_hop
+            t_audio_positions = torch.arange(target_len, device=waveform.device).float() * frontend_hop + frontend_hop / 2
+            if Td > 0:
+                dac_frame_indices = (t_audio_positions / dac_hop).round().clamp_(0, Td - 1).long()
+                dac_tokens = dac_tokens_raw.index_select(1, dac_frame_indices)
+            else:
+                dac_tokens = dac_tokens_raw.new_zeros(B0, target_len, Ccode)
+
+            # Speech alignment
+            speech_raw = speech_outputs['speech_tokens']  # [B, Ts]
+            Ts = speech_raw.size(1)
+            if Ts > 0:
+                speech_hop = audio_len / Ts
+                speech_indices = (t_audio_positions / speech_hop).round().clamp_(0, Ts - 1).long()
+                speech_tokens = speech_raw.index_select(1, speech_indices)
+            else:
+                speech_tokens = speech_raw.new_zeros(B0, target_len)
+
+            # Music alignment (continuous)
+            music_features = music_outputs['music_features']  # [B, Tm, F]
+            Bm, Tm, Fm = music_features.shape
+            if Tm > 0:
+                music_hop = audio_len / Tm
+                music_indices = (t_audio_positions / music_hop).round().clamp_(0, Tm - 1).long()
+                music_features_interp = music_features.index_select(1, music_indices)
+            else:
+                music_features_interp = music_features.new_zeros(Bm, target_len, Fm)
+
+            # Optional smoothing (simple moving average) on continuous features
+            k = getattr(self.config, 'alignment_smooth_kernel', 0)
+            if k and k > 1 and k % 2 == 1:
+                pad = k // 2
+                # depthwise conv over time per channel
+                Bc, Lc, Fc = music_features_interp.shape
+                w = torch.ones(Fc, 1, k, device=music_features_interp.device) / k
+                mv = F.conv1d(
+                    music_features_interp.transpose(1, 2), w, padding=pad, groups=Fc
+                ).transpose(1, 2)
+                music_features_interp = mv
+
+            teacher_labels['dac_tokens'] = dac_tokens
+            teacher_labels['speech_tokens'] = speech_tokens
+            teacher_labels['music_features'] = music_features_interp
+
+            if getattr(self.config, 'alignment_return_indices', False):
+                teacher_labels['dac_frame_indices'] = dac_frame_indices
+                teacher_labels['speech_frame_indices'] = speech_indices if 'speech_indices' in locals() else torch.empty(0, dtype=torch.long)
+                teacher_labels['music_frame_indices'] = music_indices if 'music_indices' in locals() else torch.empty(0, dtype=torch.long)
+
         return teacher_labels
     
     def compute_losses(self, 
@@ -138,14 +189,17 @@ class HuMERTModel(nn.Module):
             encoded_features = self.encoder(features)
             
             if task == 'all':
-                # All prediction heads
                 predictions = self.prediction_heads(encoded_features)
             else:
-                # Single task prediction
-                predictions = {
-                    f'{task}_output': self.prediction_heads.compute_predictions(encoded_features, task)
-                }
-            
+                single = self.prediction_heads.compute_predictions(encoded_features, task)
+                if task == 'dac':
+                    predictions = {'dac_logits': single}
+                elif task == 'speech':
+                    predictions = {'speech_logits': single}
+                elif task == 'music':
+                    predictions = {'music_features': single}
+                else:
+                    raise ValueError("Unknown task")
             predictions['encoded_features'] = encoded_features
             
         return predictions

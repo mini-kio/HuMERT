@@ -24,6 +24,18 @@ from training.optimizer import create_optimizer_and_scheduler, GradientClipper, 
 from training.data_loader import create_data_loaders
 
 
+def set_seed(seed: int = 42):
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False  # allow perf
+    torch.backends.cudnn.benchmark = True
+
+
 class HuMERTTrainer:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -169,6 +181,13 @@ class HuMERTTrainer:
         for key, value in outputs.items():
             if key.endswith('_weighted') and isinstance(value, torch.Tensor):
                 metrics[key] = value.item()
+            if key in ('dac','speech','music') and isinstance(value, torch.Tensor):
+                metrics[f'{key}_raw'] = value.item()
+        if 'task_weights' in outputs:
+            tw = outputs['task_weights']
+            for i, name in enumerate(['dac','speech','music']):
+                if i < tw.numel():
+                    metrics[f'{name}_weight'] = float(tw[i].item())
         
         return metrics
     
@@ -350,6 +369,8 @@ def main():
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
     
     args = parser.parse_args()
+
+    set_seed(42)
     
     # Load configuration
     with open(args.config, 'r') as f:

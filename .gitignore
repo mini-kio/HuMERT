@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.env/
+.venv/
+
+# Audio / large media (keep examples folder if needed)
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+reconstructed*.wav
+
+# Checkpoints & logs
+*.pt
+*.ckpt
+checkpoints/
+logs/
+wandb/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary
+*.tmp
+*.bak
+
+# Cache
+.cache/

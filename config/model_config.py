@@ -35,6 +35,9 @@ class ModelConfig:
     dac_codebooks: int = 9
     dac_frame_rate: int = 50
     dac_vocab_size: int = 1024
+    dac_model_type: str = '44khz'        # actual pretrained DAC model sample rate
+    dac_model_bitrate: str = '8kbps'
+    dac_target_channels: int = 2         # stereo expected by 44.1k model; we upmix if mono
     
     # Speech Teacher
     speech_clusters: int = 1500
@@ -43,6 +46,12 @@ class ModelConfig:
     # Musical Teacher
     cqt_bins: int = 84
     chroma_bins: int = 12
+    cqt_fmin: float = 32.7
+    cqt_hop_length: int = 512
+
+    # Alignment options
+    alignment_return_indices: bool = False  # if True, return mapping indices for debugging
+    alignment_smooth_kernel: int = 0        # odd >1 applies temporal smoothing after alignment (continuous feats)
     
     def __post_init__(self):
         if self.conv_block_strides is None:
@@ -89,6 +98,14 @@ class TrainingConfig:
     # Validation
     val_frequency: int = 5000
     val_patience: int = 3
+
+    # Scheduler / total steps
+    total_steps: int = 0  # If 0, will be computed from stage steps
+    min_lr_ratio: float = 0.1  # floor_lr = base_lr * min_lr_ratio
+
+    def __post_init__(self):
+        if self.total_steps == 0:
+            self.total_steps = self.stage1_steps + self.stage2_steps + self.stage3_steps
 
 
 def get_model_config() -> ModelConfig:

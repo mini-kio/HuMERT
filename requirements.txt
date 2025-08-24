@@ -6,6 +6,7 @@ torchvision>=0.15.0
 # Audio processing
 librosa>=0.10.0
 soundfile>=0.12.1
+audiotools>=0.7.2  # For Descript Audio Codec (DAC)
 
 # Flash attention and optimizations
 flash-attn>=2.5.0

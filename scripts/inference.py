@@ -73,11 +73,9 @@ class HuMERTInference:
         
         with torch.no_grad():
             outputs = self.model.inference(waveform, task='speech')
-        
-        speech_logits = outputs['speech_output']
+        speech_logits = outputs['speech_logits']
         predictions = torch.softmax(speech_logits, dim=-1)
         predicted_clusters = predictions.argmax(dim=-1)
-        
         return {
             'predicted_clusters': predicted_clusters.cpu().numpy(),
             'probabilities': predictions.cpu().numpy(),
@@ -90,9 +88,7 @@ class HuMERTInference:
         
         with torch.no_grad():
             outputs = self.model.inference(waveform, task='music')
-        
-        music_features = outputs['music_output']
-        
+        music_features = outputs['music_features']
         return {
             'music_features': music_features.cpu().numpy(),
             'feature_dim': music_features.shape[-1]
@@ -104,14 +100,10 @@ class HuMERTInference:
         
         with torch.no_grad():
             outputs = self.model.inference(waveform, task='dac')
-        
-        dac_logits = outputs['dac_output']  # [B, T, 9, 1024]
-        
-        # Get predicted tokens for each codebook
+        dac_logits = outputs['dac_logits']  # [B, T, 9, 1024]
         predicted_tokens = dac_logits.argmax(dim=-1)  # [B, T, 9]
         probabilities = torch.softmax(dac_logits, dim=-1)
         confidence = probabilities.max(dim=-1)[0]  # [B, T, 9]
-        
         return {
             'predicted_tokens': predicted_tokens.cpu().numpy(),
             'confidence': confidence.cpu().numpy(),

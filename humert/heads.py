@@ -230,35 +230,40 @@ class MultiTaskLoss(nn.Module):
     
     def update_gradnorm_weights(self, losses: Dict[str, torch.Tensor], shared_params: torch.Tensor):
         """Update task weights using GradNorm algorithm"""
-        # Compute gradients w.r.t shared parameters
-        task_grads = {}
-        for task, loss in losses.items():
-            if loss.requires_grad:
-                grad = torch.autograd.grad(loss, shared_params, retain_graph=True, create_graph=True)[0]
-                task_grads[task] = torch.norm(grad)
-        
-        if len(task_grads) > 1:
-            # Compute relative loss ratios
-            current_losses = torch.tensor([losses[task].item() for task in ['dac', 'speech', 'music']])
-            
-            if self.initial_losses.sum() == 0:
-                self.initial_losses = current_losses.clone()
-            
-            loss_ratios = current_losses / (self.initial_losses + 1e-8)
-            
-            # Compute gradient norms
-            grad_norms = torch.tensor([task_grads.get(task, 0.0) for task in ['dac', 'speech', 'music']])
-            
-            # Update weights using GradNorm
-            mean_grad_norm = grad_norms.mean()
-            mean_loss_ratio = loss_ratios.mean()
-            
-            targets = mean_grad_norm * (loss_ratios / mean_loss_ratio) ** self.alpha
-            
-            # Update task weights
-            for i, (task, target) in enumerate(zip(['dac', 'speech', 'music'], targets)):
-                if task in task_grads:
-                    self.task_weights[i] = self.task_weights[i] * (target / (grad_norms[i] + 1e-8))
+        task_order = ['dac', 'speech', 'music']
+        valid_tasks = [t for t in task_order if t in losses]
+        if len(valid_tasks) < 2:
+            return
+        # Compute per-task grad norm
+        grad_norms = []
+        current_losses = []
+        for t in task_order:
+            if t in losses:
+                grad = torch.autograd.grad(losses[t], shared_params, retain_graph=True, create_graph=True)[0]
+                grad_norms.append(grad.norm())
+                current_losses.append(losses[t].detach())
+            else:
+                grad_norms.append(torch.tensor(0.0, device=shared_params.device))
+                current_losses.append(torch.tensor(0.0, device=shared_params.device))
+        grad_norms = torch.stack(grad_norms)
+        current_losses = torch.stack(current_losses)
+        if self.initial_losses.sum() == 0:
+            self.initial_losses = current_losses.detach().clamp_min(1e-8)
+        loss_ratios = (current_losses / self.initial_losses).clamp_min(1e-6)
+        mean_loss_ratio = loss_ratios[loss_ratios>0].mean()
+        mean_grad_norm = grad_norms[grad_norms>0].mean().detach()
+        targets = mean_grad_norm * (loss_ratios / mean_loss_ratio) ** self.alpha
+        new_weights = []
+        for i, t in enumerate(task_order):
+            if t in losses and grad_norms[i] > 0:
+                w = self.task_weights[i] * (targets[i] / (grad_norms[i] + 1e-8))
+            else:
+                w = self.task_weights[i]
+            new_weights.append(w)
+        new_weights = torch.stack(new_weights)
+        # Normalize weights (avoid collapse)
+        denom = new_weights.sum().clamp_min(1e-6)
+        self.task_weights = (new_weights / denom) * len(task_order)
     
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
                 mask: Optional[torch.Tensor] = None, shared_params: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
@@ -279,14 +284,14 @@ class MultiTaskLoss(nn.Module):
             self.update_gradnorm_weights(losses, shared_params)
         
         # Compute weighted total loss
-        total_loss = 0
+        total_loss = 0.0
         task_names = ['dac', 'speech', 'music']
         for i, task in enumerate(task_names):
             if task in losses:
-                weighted_loss = self.task_weights[i] * losses[task]
-                losses[f'{task}_weighted'] = weighted_loss
-                total_loss += weighted_loss
-        
-        losses['total'] = total_loss
-        
+                weighted = self.task_weights[i] * losses[task]
+                losses[f'{task}_weighted'] = weighted
+                losses[f'{task}_weight'] = self.task_weights[i].detach()
+                total_loss += weighted
+        losses['total'] = total_loss if isinstance(total_loss, torch.Tensor) else torch.tensor(total_loss, device=shared_params.device if shared_params is not None else next(iter(predictions.values())).device)
+        losses['task_weights'] = self.task_weights.detach().clone()
         return losses

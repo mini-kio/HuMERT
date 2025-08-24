@@ -128,7 +128,14 @@ class ConvFrontend24k(nn.Module):
         pos_x = x.transpose(1, 2)  # [B, hidden_dim, T]
         pos_x = self.pos_conv(pos_x)
         pos_x = pos_x.transpose(1, 2)  # [B, T, hidden_dim]
-        
+        # Some kernel/padding combos (even kernel) can produce off-by-one length.
+        if pos_x.size(1) > x.size(1):
+            pos_x = pos_x[:, :x.size(1)]
+        elif pos_x.size(1) < x.size(1):
+            # pad at end
+            pad_len = x.size(1) - pos_x.size(1)
+            pad_tensor = pos_x.new_zeros(pos_x.size(0), pad_len, pos_x.size(2))
+            pos_x = torch.cat([pos_x, pad_tensor], dim=1)
         x = x + pos_x
         
         # Apply masking if specified

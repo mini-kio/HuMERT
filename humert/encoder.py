@@ -31,32 +31,26 @@ class FAVORPlusAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_dim // self.num_heads
         self.scale = self.head_dim ** -0.5
-        
+
         self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
-        
-        # FAVOR+ parameters
+
         self.num_features = max(64, self.head_dim)
-        self.random_features = None
-        
-        # ALiBi-style bias
-        slopes = torch.tensor([1.0 / (2 ** (8 * i / config.num_attention_heads)) 
-                              for i in range(config.num_attention_heads)])
+        random_projection = torch.randn(self.num_heads, self.head_dim, self.num_features) / math.sqrt(self.head_dim)
+        self.register_buffer('random_projection', random_projection)
+
+        slopes = torch.tensor([1.0 / (2 ** (8 * i / config.num_attention_heads)) for i in range(config.num_attention_heads)])
         self.register_buffer('alibi_slopes', slopes.view(1, config.num_attention_heads, 1, 1))
         
-    def create_random_features(self, batch_size: int, seq_len: int, device: torch.device):
-        if self.random_features is None or self.random_features.shape[0] != batch_size:
-            self.random_features = torch.randn(
-                batch_size, self.num_heads, self.num_features, self.head_dim,
-                device=device, dtype=torch.float32
-            ) / math.sqrt(self.head_dim)
-    
     def phi(self, x: torch.Tensor) -> torch.Tensor:
-        # FAVOR+ kernel approximation
-        x_proj = torch.einsum('bhld,bhfd->bhlf', x, self.random_features)
-        return F.relu(x_proj) / math.sqrt(self.num_features)
+        """FAVOR+ positive random features mapping (ReLU kernel approx)."""
+        # x: [B, H, L, D]; projection: [H, D, F]
+        x_proj = torch.einsum('bhld,hdf->bhlf', x, self.random_projection)
+        # Stabilize: subtract max per token to reduce overflow before exp if used.
+        # Here we keep ReLU feature map; add epsilon for numerical stability.
+        return F.relu(x_proj) + 1e-6
     
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -66,21 +60,25 @@ class FAVORPlusAttention(nn.Module):
         k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Create random features for FAVOR+
-        self.create_random_features(batch_size, seq_len, hidden_states.device)
-        
         # Apply FAVOR+ approximation
-        q_prime = self.phi(q * self.scale)
-        k_prime = self.phi(k)
-        
-        # Linear attention computation O(n)
-        kv = torch.einsum('bhlf,bhld->bhfd', k_prime, v)
-        out = torch.einsum('bhlf,bhfd->bhld', q_prime, kv)
-        
-        # Add ALiBi bias (positional encoding)
-        position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).unsqueeze(0)
-        alibi_bias = self.alibi_slopes * position_ids
-        out = out + alibi_bias
+        q_prime = self.phi(q * self.scale)  # [B,H,L,F]
+        k_prime = self.phi(k)               # [B,H,L,F]
+
+        # Optional causal / padding mask support
+        if attention_mask is not None:
+            # attention_mask: [B, L] (1 = keep, 0 = mask)
+            mask = attention_mask[:, None, :, None].to(q_prime.dtype)
+            k_prime = k_prime * mask
+            v = v * mask
+
+        # Compute denominator for normalization: q' * sum_k k'
+        k_sum = k_prime.sum(dim=2)  # [B,H,F]
+        denom = torch.einsum('bhlf,bhf->bhl', q_prime, k_sum) + 1e-6  # [B,H,L]
+
+        # Compute numerator: (q' * (k'^T v)) using associative trick
+        kv = torch.einsum('bhlf,bhld->bhfd', k_prime, v)  # [B,H,F,D]
+        out = torch.einsum('bhlf,bhfd->bhld', q_prime, kv)  # [B,H,L,D]
+        out = out / denom[..., None]  # Normalize
         
         # Reshape and project
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
@@ -140,11 +138,14 @@ class FlashLinearTransformerEncoder(nn.Module):
         ])
         
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        use_ckpt = getattr(self.config, 'use_activation_checkpointing', False) and self.training
+        if use_ckpt:
+            from torch.utils.checkpoint import checkpoint
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, attention_mask)
-            
-            # Apply adapter gating
+            if use_ckpt:
+                hidden_states = checkpoint(lambda hs, am=None: layer(hs, am), hidden_states, attention_mask)
+            else:
+                hidden_states = layer(hidden_states, attention_mask)
             gate = self.adapter_gates[i](hidden_states)
             hidden_states = hidden_states * gate
-            
         return self.final_norm(hidden_states)
