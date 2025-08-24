@@ -131,6 +131,10 @@ class HuMERTTrainer:
 
         if self.scaler is not None:
             with self.autocast():
+                # propagate global step for dynamic masking schedule
+                model_base = self.model.module if hasattr(self.model, 'module') else self.model
+                if hasattr(model_base, 'frontend'):
+                    model_base.frontend.global_step = self.global_step
                 outputs = self.model(waveforms, return_teacher_labels=True, active_heads=active_heads)
                 loss = outputs['total']
             self.scaler.scale(loss).backward()
@@ -139,6 +143,9 @@ class HuMERTTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
+            model_base = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(model_base, 'frontend'):
+                model_base.frontend.global_step = self.global_step
             outputs = self.model(waveforms, return_teacher_labels=True, active_heads=active_heads)
             loss = outputs['total']
             loss.backward()
@@ -162,6 +169,8 @@ class HuMERTTrainer:
                 metrics[key] = float(value.item())
             if key in ('dac','speech','music') and isinstance(value, torch.Tensor):
                 metrics[f'{key}_raw'] = float(value.item())
+            if key in ('contrastive','music_ms_consistency') and isinstance(value, torch.Tensor):
+                metrics[f'{key}_raw'] = float(value.item())
         if 'task_weights' in outputs:
             tw = outputs['task_weights']
             for i, name in enumerate(['dac','speech','music']):
@@ -171,6 +180,11 @@ class HuMERTTrainer:
             metrics['dac_codebook_perplexity_mean'] = float(outputs['dac_codebook_perplexity'].mean().item())
         if 'dac_codebook_unique' in outputs:
             metrics['dac_codebook_unique_mean'] = float(outputs['dac_codebook_unique'].float().mean().item())
+        # Additional codebook stats (masked/unmasked/moving average) if present in model stats
+        model_stats = model_base.get_model_stats() if hasattr(model_base, 'get_model_stats') else {}
+        for k in ['codebook_perplexity','codebook_perplexity_masked','codebook_perplexity_unmasked','codebook_perplexity_ma','codebook_unique_avg']:
+            if k in model_stats and isinstance(model_stats[k], (int,float)):
+                metrics[k] = float(model_stats[k])
         return metrics
     
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:

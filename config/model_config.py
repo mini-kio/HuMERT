@@ -55,6 +55,30 @@ class ModelConfig:
     
     # Logging / diagnostics
     log_codebook_stats: bool = True         # log codebook perplexity & unique token counts during training
+    log_codebook_moving_avg: bool = True    # keep moving average of perplexities
+    codebook_mavg_alpha: float = 0.01       # EMA factor for moving averages
+
+    # Alignment refinement
+    alignment_linear_interpolate: bool = True  # use linear interpolation for continuous teacher features
+
+    # Dynamic masking
+    mask_prob_schedule: tuple = None        # e.g., ((0,0.65),(100000,0.55),(200000,0.5))
+    mask_length_range: tuple = (6, 14)      # random uniform length in range
+
+    # Contrastive regularization
+    use_contrastive: bool = True
+    contrastive_dim: int = 256
+    contrastive_temperature: float = 0.1
+    contrastive_subsample: int = 4096        # max samples for contrastive per batch
+    multi_scale_consistency_weight: float = 0.1
+
+    # Music multi-scale
+    music_multi_scale: bool = True
+    cqt_hop_length2: int = 1024             # second scale hop length
+
+    # Speech teacher (external mHuBERT pipeline & optional KMeans centroids file)
+    speech_use_mhubert: bool = True
+    speech_kmeans_centroids_path: str = ''
     
     def __post_init__(self):
         if self.conv_block_strides is None:
@@ -112,6 +136,9 @@ class TrainingConfig:
     ema_update_after: int = 1000            # start EMA updates after this many global steps
     ema_device: str = 'cpu'                 # store EMA weights on cpu to save GPU memory
     use_ema_for_eval: bool = True           # swap to EMA weights during validation
+    
+    # Contrastive loss weight (scales inside GradNorm still)
+    contrastive_loss_scale: float = 1.0
 
     def __post_init__(self):
         if self.total_steps == 0:

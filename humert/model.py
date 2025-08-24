@@ -108,6 +108,12 @@ class HuMERTModel(nn.Module):
                         flat = tokens.view(-1, Cb)  # [B*T, C]
                         uniques = []
                         perplexities = []
+                        # Masked/unmasked split (if mask_indices provided)
+                        mask_flat = None
+                        if mask_indices is not None:
+                            mask_flat = mask_indices.view(-1)
+                        perp_masked = []
+                        perp_unmasked = []
                         for c in range(Cb):
                             col = flat[:, c]
                             vals, counts = col.unique(return_counts=True)
@@ -116,8 +122,33 @@ class HuMERTModel(nn.Module):
                             perp = (entropy.exp()).clamp_min(1.0)
                             perplexities.append(perp)
                             uniques.append(float(vals.numel()))
+                            if mask_flat is not None:
+                                col_m = col[mask_flat]
+                                if col_m.numel() > 0:
+                                    v2, c2 = col_m.unique(return_counts=True)
+                                    p2 = c2.float() / c2.sum()
+                                    ent2 = -(p2 * (p2+1e-12).log()).sum()
+                                    perp_masked.append((ent2.exp()).clamp_min(1.0))
+                                col_u = col[~mask_flat]
+                                if col_u.numel() > 0:
+                                    v3, c3 = col_u.unique(return_counts=True)
+                                    p3 = c3.float() / c3.sum()
+                                    ent3 = -(p3 * (p3+1e-12).log()).sum()
+                                    perp_unmasked.append((ent3.exp()).clamp_min(1.0))
                         outputs['dac_codebook_unique'] = torch.tensor(uniques, device=encoded_features.device)
                         outputs['dac_codebook_perplexity'] = torch.stack(perplexities)
+                        if perp_masked:
+                            outputs['dac_codebook_perplexity_masked'] = torch.stack(perp_masked)
+                        if perp_unmasked:
+                            outputs['dac_codebook_perplexity_unmasked'] = torch.stack(perp_unmasked)
+                        # Moving average tracking
+                        if getattr(self.config, 'log_codebook_moving_avg', False):
+                            if not hasattr(self, '_codebook_perp_ma'):
+                                self._codebook_perp_ma = outputs['dac_codebook_perplexity'].detach().clone()
+                            else:
+                                alpha = getattr(self.config, 'codebook_mavg_alpha', 0.01)
+                                self._codebook_perp_ma.mul_(1-alpha).add_(outputs['dac_codebook_perplexity'].detach(), alpha=alpha)
+                            outputs['dac_codebook_perplexity_ma'] = self._codebook_perp_ma.detach().clone()
         
         return outputs
     
@@ -165,8 +196,19 @@ class HuMERTModel(nn.Module):
             Bm, Tm, Fm = music_features.shape
             if Tm > 0:
                 music_hop = audio_len / Tm
-                music_indices = (t_audio_positions / music_hop).round().clamp_(0, Tm - 1).long()
-                music_features_interp = music_features.index_select(1, music_indices)
+                if getattr(self.config, 'alignment_linear_interpolate', False):
+                    # fractional positions
+                    pos = t_audio_positions / music_hop
+                    pos_clamped = pos.clamp(0, Tm - 1 - 1e-6)
+                    left = pos_clamped.floor().long()
+                    right = (left + 1).clamp(max=Tm-1)
+                    w = (pos_clamped - left.float()).unsqueeze(0).unsqueeze(-1)  # [1,T,1]
+                    left_feats = music_features.index_select(1, left)
+                    right_feats = music_features.index_select(1, right)
+                    music_features_interp = left_feats * (1 - w) + right_feats * w
+                else:
+                    music_indices = (t_audio_positions / music_hop).round().clamp_(0, Tm - 1).long()
+                    music_features_interp = music_features.index_select(1, music_indices)
             else:
                 music_features_interp = music_features.new_zeros(Bm, target_len, Fm)
 
@@ -185,6 +227,10 @@ class HuMERTModel(nn.Module):
             teacher_labels['dac_tokens'] = dac_tokens
             teacher_labels['speech_tokens'] = speech_tokens
             teacher_labels['music_features'] = music_features_interp
+            # Multi-scale additional supervised targets if present
+            if 'cqt_features_scale1' in music_outputs and 'cqt_features_scale2' in music_outputs:
+                teacher_labels['cqt_features_scale1'] = music_outputs['cqt_features_scale1']
+                teacher_labels['cqt_features_scale2'] = music_outputs['cqt_features_scale2']
 
             if getattr(self.config, 'alignment_return_indices', False):
                 teacher_labels['dac_frame_indices'] = dac_frame_indices

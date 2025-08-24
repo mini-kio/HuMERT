@@ -119,49 +119,95 @@ class DACTeacher(nn.Module):
 
 
 class SpeechTeacher(nn.Module):
+    """mHuBERT-based speech teacher using HF pipeline + optional KMeans clustering.
+    Falls back to simple conv features if transformers not installed or disabled.
+    """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.num_clusters = config.speech_clusters
-        self.num_languages = config.speech_languages
+        self.use_mhubert = getattr(config, 'speech_use_mhubert', True)
+        self.kmeans_path = getattr(config, 'speech_kmeans_centroids_path', '')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._pipe = None
+        self._centroids = None
+        # Fallback lightweight conv stack if pipeline unavailable
+        self.fallback = nn.Sequential(
+            nn.Conv1d(1, 128, 400, stride=160, padding=200),
+            nn.GELU(),
+            nn.Conv1d(128, 256, 3, padding=1),
+            nn.GELU(),
+        )
+        self.proj = nn.Linear(256, 256)
 
-        self.mel_extractor = nn.Conv1d(1, 80, 400, stride=160, padding=200)
-        self.mfcc_extractor = nn.Conv1d(80, 13, 1)
+    def _load_pipeline(self):
+        if self._pipe is not None:
+            return
+        if not self.use_mhubert:
+            return
+        try:
+            from transformers import pipeline
+            self._pipe = pipeline("feature-extraction", model="utter-project/mHuBERT-147", device=0 if torch.cuda.is_available() else -1)
+        except Exception:
+            self._pipe = None
+        # Load KMeans centroids if provided
+        if self.kmeans_path and self.kmeans_path.strip():
+            try:
+                arr = torch.load(self.kmeans_path, map_location='cpu')
+                if isinstance(arr, dict) and 'centroids' in arr:
+                    arr = arr['centroids']
+                self._centroids = arr.float()  # [K, D]
+            except Exception:
+                self._centroids = None
 
-        self.feature_proj = nn.Linear(93, 256)
-        self.lang_proj = nn.Linear(256 + 64, 256)
-        self.cluster_proj = nn.Linear(256, self.num_clusters)
+    def _extract_mhubert(self, waveform: torch.Tensor) -> torch.Tensor:
+        self._load_pipeline()
+        if self._pipe is None:
+            return None  # signal fallback
+        feats_list = []
+        for w in waveform:  # iterate batch
+            w_np = w.cpu().numpy()
+            feats = self._pipe(w_np, sampling_rate=self.config.input_sample_rate)
+            if isinstance(feats, list):
+                feats = feats[0]
+            feats_t = torch.tensor(feats, device=waveform.device, dtype=torch.float32)
+            feats_list.append(feats_t)
+        # Pad to max length
+        max_len = max(f.size(0) for f in feats_list)
+        dim = feats_list[0].size(-1)
+        out = waveform.new_zeros(len(feats_list), max_len, dim)
+        for i, f in enumerate(feats_list):
+            out[i, :f.size(0)] = f
+        return out  # [B, T, D]
 
-        self.language_embedding = nn.Embedding(self.num_languages, 64)
-        self.temperature_alpha = 0.7
-
-    def extract_features(self, waveform: torch.Tensor) -> torch.Tensor:
-        if waveform.dim() == 2:
-            waveform = waveform.unsqueeze(1)
-        mel = self.mel_extractor(waveform)
-        mel = torch.log(mel.clamp(min=1e-8))
-        mfcc = self.mfcc_extractor(mel)
-        combined = torch.cat([mel, mfcc], dim=1)
-        return combined.transpose(1, 2)
-
-    def cluster_features(self, features: torch.Tensor, language_ids: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.feature_proj(features)
-        if language_ids is not None:
-            lang_emb = self.language_embedding(language_ids).unsqueeze(1).expand(-1, x.size(1), -1)
-            x = torch.cat([x, lang_emb], dim=-1)
-            x = self.lang_proj(x)
-        logits = self.cluster_proj(x)
-        probs = F.softmax(logits / self.temperature_alpha, dim=-1)
-        return logits, probs
+    def _cluster(self, features: torch.Tensor) -> torch.Tensor:
+        if self._centroids is None:
+            # simple argmax over linear projection to num_clusters
+            proj = torch.randn(features.size(-1), self.num_clusters, device=features.device)
+            logits = features @ proj
+            return logits.argmax(dim=-1)
+        # L2 distance to centroids
+        # features: [B,T,D], centroids: [K,D]
+        f2 = (features**2).sum(-1, keepdim=True)
+        c2 = (self._centroids.to(features.device)**2).sum(-1)  # [K]
+        dots = features @ self._centroids.to(features.device).t()  # [B,T,K]
+        dists = f2 - 2*dots + c2
+        return dists.argmin(dim=-1)
 
     def forward(self, waveform: torch.Tensor, language_ids: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        features = self.extract_features(waveform)
-        logits, probs = self.cluster_features(features, language_ids)
-        tokens = logits.argmax(dim=-1)
+        if waveform.dim() == 2:
+            wf = waveform.unsqueeze(1)
+        else:
+            wf = waveform
+        feats = self._extract_mhubert(wf.squeeze(1)) if self.use_mhubert else None
+        if feats is None:
+            # fallback conv features
+            convf = self.fallback(wf)  # [B,256,T']
+            feats = convf.transpose(1,2)
+        tokens = self._cluster(feats)
         return {
             'speech_tokens': tokens,
-            'speech_probs': probs,
-            'speech_features': features
+            'speech_features': feats
         }
 
 
@@ -172,8 +218,10 @@ class MusicalTeacher(nn.Module):
         self.cqt_bins = config.cqt_bins
         self.chroma_bins = config.chroma_bins
         self.hop_length = getattr(config, 'cqt_hop_length', 512)
+        self.hop_length2 = getattr(config, 'cqt_hop_length2', 1024)
         self.sample_rate = 24000
         self.fmin = getattr(config, 'cqt_fmin', 32.7)
+        self.multi_scale = getattr(config, 'music_multi_scale', False)
 
         self.cqt_processor = nn.Sequential(
             nn.Linear(self.cqt_bins, 128),
@@ -191,17 +239,16 @@ class MusicalTeacher(nn.Module):
         """Batch CQT extraction with torchaudio (fallback to librosa) -> [B, T, cqt_bins]."""
         try:
             import torchaudio
-            # torchaudio cqt: output shape [B, freq, time]
             cqt = torchaudio.functional.compute_cqt(
                 waveform.to(torch.float32),
                 sr=self.sample_rate,
                 hop_length=self.hop_length,
-                fmin=float(self.fmin),  # configurable
+                fmin=float(self.fmin),
                 n_bins=self.cqt_bins,
-            )  # [B, freq, time]
+            )
             cqt = torch.abs(cqt)
             cqt = torch.log(cqt + 1e-8)
-            return cqt.transpose(1, 2)  # [B, time, freq]
+            return cqt.transpose(1, 2)
         except Exception:
             feats = []
             for w in waveform:
@@ -214,13 +261,12 @@ class MusicalTeacher(nn.Module):
     def extract_chroma_features(self, waveform: torch.Tensor) -> torch.Tensor:
         try:
             import torchaudio
-            # Approximate chroma via projecting CQT bins into 12 classes (simple pooling)
-            cqt = self.extract_cqt_features(waveform)  # [B,T,F]
+            cqt = self.extract_cqt_features(waveform)
             if cqt.size(-1) % self.chroma_bins == 0:
                 group = cqt.size(-1) // self.chroma_bins
                 chroma = cqt.view(cqt.size(0), cqt.size(1), self.chroma_bins, group).mean(-1)
             else:
-                chroma = F.interpolate(cqt.transpose(1,2), size=self.chroma_bins, mode='linear', align_corners=False).transpose(1,2)
+                chroma = F.interpolate(cqt.transpose(1, 2), size=self.chroma_bins, mode='linear', align_corners=False).transpose(1, 2)
             return chroma
         except Exception:
             feats = []
@@ -231,14 +277,44 @@ class MusicalTeacher(nn.Module):
             return torch.stack(feats, dim=0)
 
     def forward(self, waveform: torch.Tensor) -> Dict[str, torch.Tensor]:
-        cqt_features = self.extract_cqt_features(waveform)
+        # Base scale
+        cqt_scale1 = self.extract_cqt_features(waveform)  # [B,T1,F]
+        processed_cqt_scale1 = self.cqt_processor(cqt_scale1)
+        processed_cqt_scale2 = None
+        combined_for_music = processed_cqt_scale1
+
+        if self.multi_scale and self.hop_length2 != self.hop_length:
+            # Second scale with different hop
+            orig_hop = self.hop_length
+            self.hop_length = self.hop_length2
+            cqt_scale2 = self.extract_cqt_features(waveform)  # [B,T2,F]
+            self.hop_length = orig_hop
+            # Time align scale2 to scale1 length (simple linear interp)
+            if cqt_scale2.size(1) != cqt_scale1.size(1):
+                target_len = max(cqt_scale1.size(1), cqt_scale2.size(1))
+                if cqt_scale1.size(1) != target_len:
+                    cqt_scale1 = F.interpolate(cqt_scale1.transpose(1,2), size=target_len, mode='linear', align_corners=False).transpose(1,2)
+                    processed_cqt_scale1 = F.interpolate(processed_cqt_scale1.transpose(1,2), size=target_len, mode='linear', align_corners=False).transpose(1,2)
+                if cqt_scale2.size(1) != target_len:
+                    cqt_scale2 = F.interpolate(cqt_scale2.transpose(1,2), size=target_len, mode='linear', align_corners=False).transpose(1,2)
+            processed_cqt_scale2 = self.cqt_processor(cqt_scale2)
+            # Combine (concat then reduce) to produce final music feature base
+            combined_cat = torch.cat([processed_cqt_scale1, processed_cqt_scale2], dim=-1)
+            if not hasattr(self, 'multi_reduce') or self.multi_reduce.in_features != combined_cat.size(-1):
+                self.multi_reduce = nn.Linear(combined_cat.size(-1), self.cqt_bins).to(combined_cat.device)
+            combined_for_music = self.multi_reduce(combined_cat)
+
         chroma_features = self.extract_chroma_features(waveform)
-        processed_cqt = self.cqt_processor(cqt_features)
+        processed_cqt = combined_for_music  # rename for downstream compatibility
         processed_chroma = self.chroma_processor(chroma_features)
         combined = torch.cat([processed_cqt, processed_chroma], dim=-1)
         output_features = self.output_proj(combined)
-        return {
+        out: Dict[str, torch.Tensor] = {
             'music_features': output_features,
-            'cqt_features': cqt_features,
-            'chroma_features': chroma_features
+            'cqt_features': processed_cqt,
+            'chroma_features': chroma_features,
         }
+        if processed_cqt_scale2 is not None:
+            out['cqt_features_scale1'] = processed_cqt_scale1
+            out['cqt_features_scale2'] = processed_cqt_scale2
+        return out

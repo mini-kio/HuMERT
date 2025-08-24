@@ -127,6 +127,16 @@ class PredictionHeads(nn.Module):
         self.enable_speech = True
         self.enable_music = True
         
+        # Contrastive projections (shared latent space)
+        if getattr(config, 'use_contrastive', False):
+            d = config.contrastive_dim
+            self.contrastive_proj_audio = nn.Linear(config.hidden_dim, d)
+            self.contrastive_proj_speech = nn.Linear(config.hidden_dim, d)
+            self.contrastive_proj_music = nn.Linear(config.hidden_dim, d)
+            nn.init.xavier_uniform_(self.contrastive_proj_audio.weight)
+            nn.init.xavier_uniform_(self.contrastive_proj_speech.weight)
+            nn.init.xavier_uniform_(self.contrastive_proj_music.weight)
+        
     def set_active_heads(self, dac: bool = True, speech: bool = True, music: bool = True):
         """Control which heads are active for gradient computation"""
         self.enable_dac = dac
@@ -154,6 +164,17 @@ class PredictionHeads(nn.Module):
             music_features = self.music_head(shared_features)
             outputs['music_features'] = music_features
         
+        # Contrastive projected features (not used for direct supervised loss)
+        if getattr(self.config, 'use_contrastive', False):
+            ca = F.normalize(self.contrastive_proj_audio(shared_features), dim=-1)
+            outputs['contrastive_audio'] = ca
+            if self.enable_speech:
+                cs = F.normalize(self.contrastive_proj_speech(shared_features), dim=-1)
+                outputs['contrastive_speech'] = cs
+            if self.enable_music:
+                cm = F.normalize(self.contrastive_proj_music(shared_features), dim=-1)
+                outputs['contrastive_music'] = cm
+        
         return outputs
     
     def compute_predictions(self, hidden_states: torch.Tensor, task: str) -> torch.Tensor:
@@ -172,19 +193,41 @@ class PredictionHeads(nn.Module):
 
 class MultiTaskLoss(nn.Module):
     def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
-        
-        # Loss functions
-        self.dac_criterion = nn.CrossEntropyLoss(ignore_index=-100)
-        self.speech_criterion = nn.CrossEntropyLoss(ignore_index=-100)
-        self.music_criterion = nn.MSELoss()
-        
-        # GradNorm parameters
-        self.alpha = config.gradnorm_alpha if hasattr(config, 'gradnorm_alpha') else 1.5
-        self.register_buffer('task_weights', torch.ones(3))  # 3 tasks
-        self.register_buffer('initial_losses', torch.zeros(3))
-        self.register_buffer('loss_ratios', torch.zeros(3))
+            super().__init__()
+            self.config = config
+
+            # --- Base task losses ---
+            self.dac_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+            self.speech_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+            self.music_criterion = nn.MSELoss()
+
+            # --- GradNorm bookkeeping (for 3 supervised tasks) ---
+            self.alpha = config.gradnorm_alpha if hasattr(config, 'gradnorm_alpha') else 1.5
+            self.register_buffer('task_weights', torch.ones(3))      # dynamic weights for dac / speech / music
+            self.register_buffer('initial_losses', torch.zeros(3))   # snapshot of initial losses
+            self.register_buffer('loss_ratios', torch.zeros(3))      # not strictly required but kept for logging/debug
+
+            # --- Auxiliary (not reweighted by GradNorm) ---
+            self.temperature = getattr(config, 'contrastive_temperature', 0.1)
+            self.contrastive_loss_scale = getattr(config, 'contrastive_loss_scale', 1.0)
+            self.max_contrastive_samples = getattr(config, 'contrastive_subsample', 4096)
+            self.ms_consistency_weight = getattr(config, 'multi_scale_consistency_weight', 0.0)
+            # Contrastive enhancements
+            self.contrastive_time_pool = getattr(config, 'contrastive_time_pool', True)
+            self.contrastive_learn_temp = getattr(config, 'contrastive_learn_temp', False)
+            if self.contrastive_learn_temp:
+                # reparameterize temperature as exp(log_temp) for positivity
+                init_t = float(getattr(config, 'contrastive_temperature', 0.1))
+                self.log_temperature = nn.Parameter(torch.log(torch.tensor(init_t)))
+            queue_size = getattr(config, 'contrastive_queue_size', 0)
+            self.contrastive_queue_size = queue_size
+            if queue_size and queue_size > 0:
+                dim = getattr(config, 'contrastive_dim', 128)
+                self.register_buffer('contrastive_queue_z1', torch.randn(queue_size, dim))
+                self.register_buffer('contrastive_queue_z2', torch.randn(queue_size, dim))
+                self.register_buffer('contrastive_queue_ptr', torch.zeros(1, dtype=torch.long))
+                self.contrastive_queue_z1 = F.normalize(self.contrastive_queue_z1, dim=-1)
+                self.contrastive_queue_z2 = F.normalize(self.contrastive_queue_z2, dim=-1)
         
     def compute_dac_loss(self, logits: torch.Tensor, targets: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute DAC reconstruction loss for all codebooks"""
@@ -279,6 +322,95 @@ class MultiTaskLoss(nn.Module):
         if 'music_features' in predictions and 'music_features' in targets:
             losses['music'] = self.compute_music_loss(predictions['music_features'], targets['music_features'], mask)
         
+        # Contrastive loss (optional, separate from GradNorm reweighting)
+        if getattr(self.config, 'use_contrastive', False) and 'contrastive_audio' in predictions:
+            ca = predictions['contrastive_audio']  # [B,T,D]
+            # Prefer speech as second view else music
+            cb = None
+            if 'contrastive_speech' in predictions:
+                cb = predictions['contrastive_speech']
+            elif 'contrastive_music' in predictions:
+                cb = predictions['contrastive_music']
+            if cb is not None:
+                # Temporal pooling (default) to stabilize and reduce compute
+                if self.contrastive_time_pool:
+                    # mean over time; if mask provided and boolean, use masked subset
+                    if mask is not None and mask.any():
+                        # mask shape [B,T], expand for weighting
+                        mfloat = mask.float()
+                        z1p = (ca * mfloat.unsqueeze(-1)).sum(1) / (mfloat.sum(1, keepdim=True) + 1e-6)
+                        z2p = (cb * mfloat.unsqueeze(-1)).sum(1) / (mfloat.sum(1, keepdim=True) + 1e-6)
+                    else:
+                        z1p = ca.mean(1)
+                        z2p = cb.mean(1)
+                else:
+                    # sample time steps as before
+                    B, T, D = ca.shape
+                    if mask is not None and mask.any():
+                        idx = mask.nonzero(as_tuple=False)  # [N,2]
+                    else:
+                        b_idx = torch.randint(0, B, (min(self.max_contrastive_samples, B*T),), device=ca.device)
+                        t_idx = torch.randint(0, T, (b_idx.size(0),), device=ca.device)
+                        idx = torch.stack([b_idx, t_idx], dim=1)
+                    if idx.size(0) > self.max_contrastive_samples:
+                        choice = torch.randperm(idx.size(0), device=ca.device)[:self.max_contrastive_samples]
+                        idx = idx[choice]
+                    z1p = ca[idx[:,0], idx[:,1]]
+                    z2p = cb[idx[:,0], idx[:,1]]
+
+                z1p = F.normalize(z1p, dim=-1)
+                z2p = F.normalize(z2p, dim=-1)
+
+                # Temperature (learnable optional)
+                temp = torch.exp(self.log_temperature) if hasattr(self, 'log_temperature') else torch.tensor(self.temperature, device=z1p.device)
+
+                # Base similarities (batch positives first)
+                logits_ab_targets = z1p @ z2p.t()
+                logits_ba_targets = z2p @ z1p.t()
+
+                # Append queue negatives if available
+                if self.contrastive_queue_size:
+                    qz2 = self.contrastive_queue_z2.detach()
+                    qz1 = self.contrastive_queue_z1.detach()
+                    logits_ab_neg = z1p @ qz2.t()  # [B,Q]
+                    logits_ba_neg = z2p @ qz1.t()  # [B,Q]
+                    logits_ab = torch.cat([logits_ab_targets, logits_ab_neg], dim=1) / temp
+                    logits_ba = torch.cat([logits_ba_targets, logits_ba_neg], dim=1) / temp
+                    labels = torch.arange(z1p.size(0), device=z1p.device, dtype=torch.long)
+                else:
+                    logits_ab = logits_ab_targets / temp
+                    logits_ba = logits_ba_targets / temp
+                    labels = torch.arange(z1p.size(0), device=z1p.device, dtype=torch.long)
+
+                loss_ab = F.cross_entropy(logits_ab, labels)
+                loss_ba = F.cross_entropy(logits_ba, labels)
+                c_loss = 0.5 * (loss_ab + loss_ba)
+                losses['contrastive'] = c_loss
+
+                # Update queues (FIFO) if enabled
+                if self.contrastive_queue_size:
+                    with torch.no_grad():
+                        bsz = z1p.size(0)
+                        ptr = int(self.contrastive_queue_ptr.item())
+                        k = self.contrastive_queue_size
+                        # If batch larger than queue, keep last k entries
+                        if bsz >= k:
+                            self.contrastive_queue_z1.copy_(z1p[-k:])
+                            self.contrastive_queue_z2.copy_(z2p[-k:])
+                            self.contrastive_queue_ptr.zero_()
+                        else:
+                            end = ptr + bsz
+                            if end <= k:
+                                self.contrastive_queue_z1[ptr:end] = z1p
+                                self.contrastive_queue_z2[ptr:end] = z2p
+                            else:
+                                first = k - ptr
+                                self.contrastive_queue_z1[ptr:] = z1p[:first]
+                                self.contrastive_queue_z1[:bsz-first] = z1p[first:]
+                                self.contrastive_queue_z2[ptr:] = z2p[:first]
+                                self.contrastive_queue_z2[:bsz-first] = z2p[first:]
+                            self.contrastive_queue_ptr[0] = (end % k)
+        
         # Update GradNorm weights if shared parameters provided
         if shared_params is not None and len(losses) > 1:
             self.update_gradnorm_weights(losses, shared_params)
@@ -292,6 +424,26 @@ class MultiTaskLoss(nn.Module):
                 losses[f'{task}_weighted'] = weighted
                 losses[f'{task}_weight'] = self.task_weights[i].detach()
                 total_loss += weighted
+        # Add contrastive (outside GradNorm weighting)
+        if 'contrastive' in losses:
+            scaled = losses['contrastive'] * self.contrastive_loss_scale
+            losses['contrastive_weighted'] = scaled
+            total_loss += scaled
+        # Multi-scale consistency (outside GradNorm)
+        if self.ms_consistency_weight > 0 and 'cqt_features_scale1' in targets and 'cqt_features_scale2' in targets:
+            f1 = targets['cqt_features_scale1']
+            f2 = targets['cqt_features_scale2']
+            # Align time length
+            if f1.size(1) != f2.size(1):
+                if f1.size(1) < f2.size(1):
+                    f1 = F.interpolate(f1.transpose(1,2), size=f2.size(1), mode='linear', align_corners=False).transpose(1,2)
+                else:
+                    f2 = F.interpolate(f2.transpose(1,2), size=f1.size(1), mode='linear', align_corners=False).transpose(1,2)
+            diff = (F.normalize(f1, dim=-1) - F.normalize(f2, dim=-1))**2
+            ms_loss = diff.mean()
+            losses['music_ms_consistency'] = ms_loss
+            losses['music_ms_consistency_weighted'] = ms_loss * self.ms_consistency_weight
+            total_loss += losses['music_ms_consistency_weighted']
         losses['total'] = total_loss if isinstance(total_loss, torch.Tensor) else torch.tensor(total_loss, device=shared_params.device if shared_params is not None else next(iter(predictions.values())).device)
         losses['task_weights'] = self.task_weights.detach().clone()
         return losses

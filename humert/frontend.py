@@ -79,24 +79,35 @@ class ConvFrontend24k(nn.Module):
     
     def apply_masking(self, features: torch.Tensor, mask_indices: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if mask_indices is None and self.training:
-            # Generate random mask
             batch_size, seq_len, _ = features.shape
-            
-            # Calculate number of tokens to mask
-            num_masked = int(seq_len * self.config.mask_prob)
-            
+            # Dynamic mask prob schedule
+            mask_prob = self.config.mask_prob
+            sched = getattr(self.config, 'mask_prob_schedule', None)
+            if sched is not None:
+                # assume global step stored externally via attribute if set
+                global_step = getattr(self, 'global_step', 0)
+                # sched: ((step, prob), ... ) sorted
+                last_p = mask_prob
+                for step, p in sched:
+                    if global_step >= step:
+                        last_p = p
+                mask_prob = last_p
+            num_masked = int(seq_len * mask_prob)
             mask_indices = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=features.device)
-            
+            min_len, max_len = getattr(self.config, 'mask_length_range', (self.config.mask_length, self.config.mask_length))
             for b in range(batch_size):
-                # Random starting positions
-                starts = torch.randint(0, max(1, seq_len - self.config.mask_length), (num_masked // self.config.mask_length + 1,))
-                
-                for start in starts:
-                    end = min(start + self.config.mask_length, seq_len)
+                covered = 0
+                attempts = 0
+                while covered < num_masked and attempts < num_masked * 4:
+                    span_len = torch.randint(min_len, max_len+1, (1,)).item()
+                    start = torch.randint(0, max(1, seq_len - span_len), (1,)).item()
+                    end = min(start + span_len, seq_len)
+                    if mask_indices[b, start:end].any():
+                        attempts += 1
+                        continue
                     mask_indices[b, start:end] = True
-                    
-                    if mask_indices[b].sum() >= num_masked:
-                        break
+                    covered += (end - start)
+                    attempts += 1
         
         if mask_indices is not None:
             # Apply masking
