@@ -37,7 +37,7 @@ HuMERT-300M is a cutting-edge universal audio understanding model that combines 
 ### Installation
 
 ```bash
-git clone https://github.com/your-repo/HuMERT.git
+git clone https://github.com/mini-kio/HuMERT.git
 cd HuMERT
 pip install -r requirements.txt
 ```
